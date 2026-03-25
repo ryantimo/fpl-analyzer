@@ -4,6 +4,7 @@ Pure data-processing functions — no Streamlit imports.
 """
 
 from collections import defaultdict
+from typing import Any
 import pandas as pd
 
 
@@ -37,11 +38,15 @@ def player_map(bootstrap: dict, live: dict | None = None) -> dict:
             "name": p["web_name"],
             "full_name": f"{p['first_name']} {p['second_name']}",
             "team": teams[p["team"]],
+            "team_id": p["team"],
             "position": pos[p["element_type"]],
             "price": p["now_cost"] / 10,
             "form": float(p["form"] or 0),
             "global_own_pct": float(p["selected_by_percent"] or 0),
             "gw_pts": live_pts.get(p["id"], p["event_points"] or 0),
+            "ep_next": float(p.get("ep_next") or 0),
+            "ep_this": float(p.get("ep_this") or 0),
+            "points_per_game": float(p.get("points_per_game") or 0),
         }
         for p in bootstrap["elements"]
     }
@@ -205,3 +210,221 @@ def build_transfers_table(
         lambda x: "✅ Good" if x > 0 else ("➖ Break even" if x == 0 else "❌ Bad")
     )
     return df
+
+
+# ── Forecast helpers ──────────────────────────────────────────────────────────
+
+def _team_fixture_map(all_fixtures: list, from_gw: int, gws_ahead: int = 5) -> dict:
+    """
+    Returns {team_id: {gw: [{"fdr": int, "opponent_id": int, "is_home": bool}]}}
+    Handles double gameweeks (multiple fixtures in one GW).
+    """
+    result: dict[int, dict[int, list]] = defaultdict(lambda: defaultdict(list))
+    target_gws = set(range(from_gw, from_gw + gws_ahead))
+    for fix in all_fixtures:
+        gw = fix.get("event")
+        if gw not in target_gws:
+            continue
+        result[fix["team_h"]][gw].append({
+            "fdr": fix["team_h_difficulty"],
+            "opponent_id": fix["team_a"],
+            "is_home": True,
+        })
+        result[fix["team_a"]][gw].append({
+            "fdr": fix["team_a_difficulty"],
+            "opponent_id": fix["team_h"],
+            "is_home": False,
+        })
+    return result
+
+
+# FPL official fixture difficulty colours
+FDR_COLORS = {
+    1: "#257d5a",  # dark green
+    2: "#01fc7a",  # bright green
+    3: "#ebebe4",  # grey
+    4: "#ff1751",  # red
+    5: "#80072d",  # dark red
+}
+FDR_TEXT = {1: "white", 2: "black", 3: "black", 4: "white", 5: "white"}
+
+
+def build_fixture_ticker(
+    bootstrap: dict,
+    all_fixtures: list,
+    from_gw: int,
+    gws_ahead: int = 5,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns (labels_df, fdr_df) both indexed by team name.
+    labels_df cells: "OPP(H)" or "OPP(A)" or "-" for blank GW / "DGW" prefix for doubles.
+    fdr_df cells: average FDR int (for colouring) or None for blank.
+    """
+    teams_short = {t["id"]: t["short_name"] for t in bootstrap["teams"]}
+    teams_full  = {t["id"]: t["name"] for t in bootstrap["teams"]}
+    fix_map = _team_fixture_map(all_fixtures, from_gw, gws_ahead)
+    gw_cols = [f"GW{gw}" for gw in range(from_gw, from_gw + gws_ahead)]
+
+    label_rows, fdr_rows = [], []
+    for tid in sorted(teams_short.keys()):
+        label_row: dict[str, Any] = {"Team": teams_full[tid]}
+        fdr_row:   dict[str, Any] = {"Team": teams_full[tid]}
+        for i, gw in enumerate(range(from_gw, from_gw + gws_ahead)):
+            col = gw_cols[i]
+            fixes = fix_map.get(tid, {}).get(gw, [])
+            if not fixes:
+                label_row[col] = "-"
+                fdr_row[col]   = None
+            else:
+                parts = [
+                    f"{teams_short.get(f['opponent_id'], '?')}({'H' if f['is_home'] else 'A'})"
+                    for f in fixes
+                ]
+                prefix = "DGW " if len(fixes) > 1 else ""
+                label_row[col] = prefix + " & ".join(parts)
+                fdr_row[col]   = round(sum(f["fdr"] for f in fixes) / len(fixes))
+        label_rows.append(label_row)
+        fdr_rows.append(fdr_row)
+
+    labels_df = pd.DataFrame(label_rows).set_index("Team")
+    fdr_df    = pd.DataFrame(fdr_rows).set_index("Team")
+    return labels_df, fdr_df
+
+
+# ── Squad projections ─────────────────────────────────────────────────────────
+
+def build_squad_forecast(
+    teams: list,
+    picks_map: dict,
+    pmap: dict,
+    all_fixtures: list,
+    from_gw: int,
+    gws_ahead: int = 3,
+) -> pd.DataFrame:
+    """
+    For each manager, project points for the next gws_ahead GWs.
+    GW+1 uses FPL's own ep_next. GW+2/3 uses form × difficulty multiplier.
+    Only starting XI (multiplier > 0) is counted.
+    """
+    fix_map = _team_fixture_map(all_fixtures, from_gw, gws_ahead)
+    gws = list(range(from_gw, from_gw + gws_ahead))
+    rows = []
+
+    for t in teams:
+        picks = picks_map.get(t["entry"])
+        if not picks:
+            continue
+
+        starters = [p for p in picks["picks"] if p.get("multiplier", 0) > 0]
+        proj: dict[int, float] = {gw: 0.0 for gw in gws}
+
+        for pick in starters:
+            info = pmap.get(pick["element"], {})
+            team_id = info.get("team_id")
+            multiplier = pick.get("multiplier", 1)  # 2 for captain, 3 for TC
+
+            for i, gw in enumerate(gws):
+                fixes = fix_map.get(team_id, {}).get(gw, [])
+                if not fixes:
+                    continue  # blank GW
+                if i == 0:
+                    # FPL's expected points, respecting captain multiplier
+                    base = info.get("ep_next", info.get("form", 0))
+                    proj[gw] += base * multiplier
+                else:
+                    form = info.get("form", 0)
+                    for fix in fixes:
+                        diff_mult = (6 - fix["fdr"]) / 5  # 1.0 easy → 0.2 very hard
+                        proj[gw] += form * diff_mult * multiplier
+
+        row: dict[str, Any] = {
+            "Manager": t["player_name"],
+            "Team name": t["entry_name"],
+        }
+        total = 0.0
+        for i, gw in enumerate(gws):
+            label = f"GW{gw}{'*' if i == 0 else ''}"
+            val = round(proj[gw], 1)
+            row[label] = val
+            total += val
+        row["3GW proj"] = round(total, 1)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("3GW proj", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# ── Transfer targets ──────────────────────────────────────────────────────────
+
+def build_transfer_targets(
+    teams: list,
+    picks_map: dict,
+    pmap: dict,
+    all_fixtures: list,
+    from_gw: int,
+    max_league_own_pct: float = 30.0,
+    min_ep_next: float = 4.0,
+) -> pd.DataFrame:
+    """
+    Players with high ep_next that fewer than max_league_own_pct % of the league own.
+    Great for identifying transfer targets / punts before the next deadline.
+    """
+    # Count league ownership
+    own_counts: dict[int, int] = defaultdict(int)
+    n = sum(1 for t in teams if picks_map.get(t["entry"]))
+    for t in teams:
+        picks = picks_map.get(t["entry"])
+        if not picks:
+            continue
+        for p in picks["picks"]:
+            own_counts[p["element"]] += 1
+
+    fix_map = _team_fixture_map(all_fixtures, from_gw, 3)
+    teams_short = {}  # built lazily from pmap
+
+    rows = []
+    for pid, info in pmap.items():
+        ep_next = info.get("ep_next", 0)
+        if ep_next < min_ep_next:
+            continue
+        own_pct = round(own_counts.get(pid, 0) / n * 100, 1) if n else 0
+        if own_pct >= max_league_own_pct:
+            continue
+
+        team_id = info.get("team_id")
+        fix_parts = []
+        for gw in range(from_gw, from_gw + 3):
+            fixes = fix_map.get(team_id, {}).get(gw, [])
+            if fixes:
+                fdrs = [str(f["fdr"]) for f in fixes]
+                fix_parts.append("/".join(fdrs))
+            else:
+                fix_parts.append("-")
+
+        rows.append({
+            "Player": info["name"],
+            "Team": info["team"],
+            "Pos": info["position"],
+            "Price": f"£{info['price']:.1f}m",
+            "ep_next": ep_next,
+            "Form": info["form"],
+            "% league": own_pct,
+            "% global": info["global_own_pct"],
+            "Next 3 FDRs": " | ".join(fix_parts),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("ep_next", ascending=False)
+        .reset_index(drop=True)
+        .head(25)
+    )

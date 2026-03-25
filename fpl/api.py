@@ -60,3 +60,8 @@ def team_transfers(team_id: int) -> list:
 def live_gw_points(gw: int) -> dict:
     """Live player points for a given gameweek."""
     return _get(f"{BASE}/event/{gw}/live/")
+
+
+def fixtures() -> list:
+    """All fixtures for the season (finished and upcoming)."""
+    return _get(f"{BASE}/fixtures/")

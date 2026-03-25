@@ -18,6 +18,11 @@ from fpl.analysis import (
     build_ownership_table,
     build_differentials,
     build_transfers_table,
+    build_fixture_ticker,
+    build_squad_forecast,
+    build_transfer_targets,
+    FDR_COLORS,
+    FDR_TEXT,
 )
 
 LEAGUE_ID = int(os.getenv("LEAGUE_ID", "1519916"))
@@ -62,6 +67,7 @@ def load_data(league_id: int, gw: int):
     boot = api.bootstrap()
     teams, league_info = api.all_league_teams(league_id)
     live = api.live_gw_points(gw)
+    all_fixtures = api.fixtures()
     pmap = player_map(boot, live)
 
     picks_map, transfers_map = {}, {}
@@ -73,7 +79,7 @@ def load_data(league_id: int, gw: int):
         transfers_map[tid] = transfers
         time.sleep(0.08)  # be polite to the FPL API
 
-    return boot, teams, league_info, pmap, picks_map, transfers_map
+    return boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures
 
 
 # ── GW picker (needs bootstrap first) ────────────────────────────────────────
@@ -97,7 +103,7 @@ with st.sidebar:
 
 try:
     with st.spinner(f"Fetching GW{selected_gw} data for all managers…"):
-        boot, teams, league_info, pmap, picks_map, transfers_map = load_data(
+        boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures = load_data(
             int(league_id), selected_gw
         )
 except Exception as e:
@@ -131,12 +137,13 @@ transfers_df = build_transfers_table(teams, transfers_map, pmap, selected_gw)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_stand, tab_cap, tab_own, tab_diff, tab_trans = st.tabs([
+tab_stand, tab_cap, tab_own, tab_diff, tab_trans, tab_fore = st.tabs([
     "📊 Standings",
     "🎖️ Captains",
     "👥 Ownership",
-    f"⚠️ Differentials",
+    "⚠️ Differentials",
     "🔄 Transfers",
+    "🔮 Forecast",
 ])
 
 # ─── Standings ────────────────────────────────────────────────────────────────
@@ -372,6 +379,126 @@ with tab_trans:
         )
         fig.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.4)
         st.plotly_chart(fig, use_container_width=True)
+
+# ─── Forecast ────────────────────────────────────────────────────────────────
+with tab_fore:
+    next_gw = selected_gw + 1
+    st.subheader(f"🔮 Forecast — GW{next_gw} onwards")
+    st.caption(
+        f"GW{next_gw} projections use FPL's own **ep_next** per player. "
+        f"GW{next_gw + 1} and GW{next_gw + 2} use form × fixture difficulty. "
+        f"Captain multiplier applied. * = ep_next column."
+    )
+
+    # ── Section 1: Fixture ticker ─────────────────────────────────────────────
+    st.markdown("### 📅 Fixture Ticker — all 20 PL teams")
+    gws_ahead = st.slider("GWs to show", 3, 8, 5, 1, key="ticker_gws")
+
+    labels_df, fdr_df = build_fixture_ticker(boot, all_fixtures, next_gw, gws_ahead)
+
+    def _color_cell(val, fdr_val):
+        if fdr_val is None:
+            return "background-color: #2a2a2a; color: #888;"
+        bg = FDR_COLORS.get(int(fdr_val), "#ebebe4")
+        fg = FDR_TEXT.get(int(fdr_val), "black")
+        return f"background-color: {bg}; color: {fg}; font-weight: 600; text-align: center;"
+
+    # Build styled dataframe by applying cell-level CSS
+    styled = labels_df.style
+    for col in labels_df.columns:
+        for team in labels_df.index:
+            fdr_val = fdr_df.at[team, col]
+            css = _color_cell(labels_df.at[team, col], fdr_val)
+            styled = styled.set_properties(
+                subset=pd.IndexSlice[[team], [col]], **{
+                    k.strip(): v.strip()
+                    for part in css.split(";") if ":" in part
+                    for k, v in [part.split(":", 1)]
+                }
+            )
+
+    st.dataframe(styled, use_container_width=True)
+
+    st.caption("🟢 Easy (FDR 1–2)  ·  ⬜ Medium (FDR 3)  ·  🔴 Hard (FDR 4–5)  ·  DGW = double gameweek")
+
+    st.divider()
+
+    # ── Section 2: Squad projections ─────────────────────────────────────────
+    st.markdown("### 👥 Squad Projections — your league managers")
+    forecast_df = build_squad_forecast(teams, picks_map, pmap, all_fixtures, next_gw, gws_ahead=3)
+
+    if forecast_df.empty:
+        st.info("No squad data available yet — check back after the deadline.")
+    else:
+        # Top/bottom managers
+        f1, f2 = st.columns(2)
+        with f1:
+            best = forecast_df.iloc[0]
+            st.metric("📈 Best 3GW outlook", best["Manager"],
+                      f"{best['3GW proj']:.0f} projected pts")
+        with f2:
+            worst = forecast_df.iloc[-1]
+            st.metric("📉 Toughest run", worst["Manager"],
+                      f"{worst['3GW proj']:.0f} projected pts")
+
+        st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+
+        # Bar chart: 3GW total projection
+        fig = px.bar(
+            forecast_df.sort_values("3GW proj", ascending=True),
+            x="3GW proj", y="Manager",
+            orientation="h",
+            color="3GW proj",
+            color_continuous_scale="RdYlGn",
+            title="3-GW projected points by manager (starting XI)",
+            text="3GW proj",
+        )
+        fig.update_traces(textposition="outside")
+        fig.update_layout(
+            showlegend=False,
+            coloraxis_showscale=False,
+            yaxis_title="",
+            height=max(300, n_teams * 28),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ── Section 3: Transfer targets ───────────────────────────────────────────
+    st.markdown("### 🎯 Transfer Targets — high ep_next, low league ownership")
+    st.caption(
+        "Players with strong expected points next GW that few in your league own. "
+        "FDR shown for next 3 GWs (1=easiest, 5=hardest)."
+    )
+
+    target_threshold = st.slider(
+        "Max league ownership %", 10, 60, 30, 5, key="target_thresh",
+        help="Only show players owned by fewer than this % of your league"
+    )
+
+    targets_df = build_transfer_targets(
+        teams, picks_map, pmap, all_fixtures, next_gw,
+        max_league_own_pct=float(target_threshold),
+    )
+
+    if targets_df.empty:
+        st.info("No targets found — try raising the ownership threshold.")
+    else:
+        st.dataframe(targets_df, use_container_width=True, hide_index=True)
+
+        fig = px.scatter(
+            targets_df,
+            x="% league",
+            y="ep_next",
+            color="Pos",
+            size=targets_df["ep_next"].clip(lower=1),
+            hover_name="Player",
+            hover_data=["Team", "Price", "Form", "Next 3 FDRs"],
+            title="Transfer targets — league ownership vs expected next GW points",
+            labels={"% league": "% owned in league", "ep_next": "Expected pts (next GW)"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()
