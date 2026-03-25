@@ -1,5 +1,7 @@
 # FPL League Analyzer ⚽
 
+**🌐 Live app: [fpl-timo.streamlit.app](https://fpl-timo.streamlit.app/)**
+
 Live gameweek analysis for your FPL mini-league — standings, rankings chart, captain %, ownership, differentials, transfers, and fixture-based forecasting.
 
 ## Tabs
