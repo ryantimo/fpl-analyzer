@@ -8,6 +8,7 @@ import time
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 
 import fpl.api as api
 from fpl.analysis import (
@@ -21,6 +22,7 @@ from fpl.analysis import (
     build_fixture_ticker,
     build_squad_forecast,
     build_transfer_targets,
+    build_rankings_chart_data,
     FDR_COLORS,
     FDR_TEXT,
 )
@@ -70,16 +72,15 @@ def load_data(league_id: int, gw: int):
     all_fixtures = api.fixtures()
     pmap = player_map(boot, live)
 
-    picks_map, transfers_map = {}, {}
+    picks_map, transfers_map, histories_map = {}, {}, {}
     for t in teams:
         tid = t["entry"]
-        picks = api.team_picks(tid, gw)
-        transfers = api.team_transfers(tid)
-        picks_map[tid] = picks
-        transfers_map[tid] = transfers
+        picks_map[tid]    = api.team_picks(tid, gw)
+        transfers_map[tid] = api.team_transfers(tid)
+        histories_map[tid] = api.team_history(tid)
         time.sleep(0.08)  # be polite to the FPL API
 
-    return boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures
+    return boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures, histories_map
 
 
 # ── GW picker (needs bootstrap first) ────────────────────────────────────────
@@ -103,7 +104,7 @@ with st.sidebar:
 
 try:
     with st.spinner(f"Fetching GW{selected_gw} data for all managers…"):
-        boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures = load_data(
+        boot, teams, league_info, pmap, picks_map, transfers_map, all_fixtures, histories_map = load_data(
             int(league_id), selected_gw
         )
 except Exception as e:
@@ -137,8 +138,9 @@ transfers_df = build_transfers_table(teams, transfers_map, pmap, selected_gw)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_stand, tab_cap, tab_own, tab_diff, tab_trans, tab_fore = st.tabs([
+tab_stand, tab_rank, tab_cap, tab_own, tab_diff, tab_trans, tab_fore = st.tabs([
     "📊 Standings",
+    "📈 Rankings",
     "🎖️ Captains",
     "👥 Ownership",
     "⚠️ Differentials",
@@ -183,6 +185,169 @@ with tab_stand:
         fig.update_layout(showlegend=False, coloraxis_showscale=False,
                           yaxis_title="", height=max(300, n_teams * 28))
         st.plotly_chart(fig, use_container_width=True)
+
+
+# ─── Rankings ─────────────────────────────────────────────────────────────────
+with tab_rank:
+    st.subheader("📈 Points trajectory — last 5 GWs + 5 GW projection")
+    st.caption(
+        "Solid lines = actual points. Dotted lines = projected. "
+        "⭐ Top 9 are highlighted with thicker lines. "
+        "Gold dashed line = top 9 cut-off at current GW."
+    )
+
+    chart_df = build_rankings_chart_data(
+        teams, histories_map, picks_map, pmap, all_fixtures,
+        current_gw_num=selected_gw, gws_back=5, gws_ahead=5, top_n=20,
+    )
+
+    if chart_df.empty:
+        st.info("No historical data available yet.")
+    else:
+        colors = px.colors.qualitative.Dark24
+        managers_by_rank = (
+            chart_df[["Manager", "rank"]]
+            .drop_duplicates()
+            .sort_values("rank")["Manager"]
+            .tolist()
+        )
+        color_map = {m: colors[i % len(colors)] for i, m in enumerate(managers_by_rank)}
+
+        fig = go.Figure()
+
+        # Shaded projected zone
+        proj_gws = chart_df[chart_df["is_projected"]]["GW"]
+        if not proj_gws.empty:
+            fig.add_vrect(
+                x0=proj_gws.min() - 0.5,
+                x1=proj_gws.max() + 0.5,
+                fillcolor="rgba(255,255,255,0.03)",
+                line_width=0,
+            )
+            fig.add_annotation(
+                x=proj_gws.min(), y=1, yref="paper",
+                text="◀ Actual  |  Projected ▶",
+                showarrow=False, font=dict(size=11, color="rgba(255,255,255,0.4)"),
+                xanchor="center",
+            )
+
+        for manager in managers_by_rank:
+            mdf = chart_df[chart_df["Manager"] == manager].sort_values("GW")
+            rank = int(mdf["rank"].iloc[0])
+            color = color_map[manager]
+            lw = 3.0 if rank <= 9 else 1.4
+            opacity = 1.0 if rank <= 9 else 0.6
+            label = f"{'⭐ ' if rank <= 9 else ''}#{rank} {manager}"
+
+            hist_df = mdf[~mdf["is_projected"]]
+            proj_df = mdf[mdf["is_projected"]]
+
+            # Historical — solid
+            if not hist_df.empty:
+                fig.add_trace(go.Scatter(
+                    x=hist_df["GW"], y=hist_df["Total"],
+                    name=label,
+                    line=dict(color=color, width=lw),
+                    opacity=opacity,
+                    mode="lines",
+                    legendgroup=manager,
+                    hovertemplate=f"<b>{manager}</b> GW%{{x}}<br>%{{y:.0f}} pts<extra></extra>",
+                ))
+
+            # Projected — dotted, connected from last real point
+            if not proj_df.empty:
+                connect = pd.concat([hist_df.tail(1), proj_df])
+                fig.add_trace(go.Scatter(
+                    x=connect["GW"], y=connect["Total"],
+                    name=label,
+                    line=dict(color=color, width=lw, dash="dot"),
+                    opacity=opacity * 0.75,
+                    mode="lines+markers",
+                    marker=dict(size=5, symbol="circle-open"),
+                    legendgroup=manager,
+                    showlegend=False,
+                    hovertemplate=f"<b>{manager}</b> GW%{{x}} (proj)<br>%{{y:.0f}} pts<extra></extra>",
+                ))
+
+            # End-of-projection label
+            if not proj_df.empty:
+                last = proj_df.iloc[-1]
+                fig.add_annotation(
+                    x=last["GW"] + 0.15, y=last["Total"],
+                    text=f"<b>{manager}</b>" if rank <= 9 else manager,
+                    showarrow=False, xanchor="left",
+                    font=dict(size=9 if rank > 9 else 10, color=color),
+                )
+
+        # Vertical "now" line
+        fig.add_vline(
+            x=selected_gw + 0.5,
+            line_dash="dash",
+            line_color="rgba(255,255,255,0.25)",
+        )
+
+        # Top-9 cut-off: gold horizontal line at rank-9 current total
+        rank9_rows = chart_df[(chart_df["rank"] == 9) & (~chart_df["is_projected"])]
+        if not rank9_rows.empty:
+            y9 = rank9_rows.sort_values("GW").iloc[-1]["Total"]
+            fig.add_hline(
+                y=y9,
+                line_dash="dot", line_color="gold", line_width=1.5,
+                annotation_text=f"Top 9 cut ({y9:.0f})",
+                annotation_position="right",
+                annotation_font=dict(color="gold", size=11),
+            )
+
+        fig.update_layout(
+            xaxis=dict(
+                title="Gameweek",
+                tickmode="linear", dtick=1,
+                showgrid=True, gridcolor="rgba(255,255,255,0.08)",
+            ),
+            yaxis=dict(
+                title="Total Points",
+                showgrid=True, gridcolor="rgba(255,255,255,0.08)",
+            ),
+            legend=dict(
+                orientation="v", yanchor="top", y=1, xanchor="left", x=1.01,
+                font=dict(size=11),
+            ),
+            hovermode="x unified",
+            height=620,
+            margin=dict(r=160),
+            plot_bgcolor="rgba(14,17,23,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Projected final standings table
+        st.subheader("Projected standings after 5 GWs")
+        proj_final = (
+            chart_df[chart_df["is_projected"]]
+            .sort_values("GW")
+            .groupby("Manager")
+            .last()
+            .reset_index()[["Manager", "Total", "rank"]]
+            .sort_values("Total", ascending=False)
+            .reset_index(drop=True)
+        )
+        proj_final.index += 1
+        proj_final.columns = ["Manager", "Projected Total", "Current Rank"]
+        proj_final.insert(0, "Proj Rank", proj_final.index)
+        proj_final["Movement"] = proj_final.apply(
+            lambda r: (
+                f"▲ {int(r['Current Rank'] - r['Proj Rank'])}"
+                if r["Current Rank"] > r["Proj Rank"]
+                else (
+                    f"▼ {int(r['Proj Rank'] - r['Current Rank'])}"
+                    if r["Current Rank"] < r["Proj Rank"]
+                    else "–"
+                )
+            ),
+            axis=1,
+        )
+        st.dataframe(proj_final, use_container_width=True, hide_index=True)
 
 
 # ─── Captains ─────────────────────────────────────────────────────────────────

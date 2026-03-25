@@ -428,3 +428,108 @@ def build_transfer_targets(
         .reset_index(drop=True)
         .head(25)
     )
+
+
+# ── Rankings chart ────────────────────────────────────────────────────────────
+
+def _project_gw_scores(
+    teams: list,
+    picks_map: dict,
+    pmap: dict,
+    all_fixtures: list,
+    from_gw: int,
+    gws_ahead: int,
+) -> dict:
+    """Returns {team_entry: {gw: projected_score}} for future GWs."""
+    fix_map = _team_fixture_map(all_fixtures, from_gw, gws_ahead)
+    gws = list(range(from_gw, from_gw + gws_ahead))
+    result = {}
+
+    for t in teams:
+        tid = t["entry"]
+        picks = picks_map.get(tid)
+        gw_scores: dict[int, float] = {gw: 0.0 for gw in gws}
+
+        if picks:
+            starters = [p for p in picks["picks"] if p.get("multiplier", 0) > 0]
+            for pick in starters:
+                info = pmap.get(pick["element"], {})
+                team_id = info.get("team_id")
+                multiplier = pick.get("multiplier", 1)
+                for i, gw in enumerate(gws):
+                    fixes = fix_map.get(team_id, {}).get(gw, [])
+                    if not fixes:
+                        continue
+                    if i == 0:
+                        base = info.get("ep_next", info.get("form", 0))
+                        gw_scores[gw] += base * multiplier
+                    else:
+                        form = info.get("form", 0)
+                        for fix in fixes:
+                            gw_scores[gw] += form * ((6 - fix["fdr"]) / 5) * multiplier
+
+        result[tid] = gw_scores
+    return result
+
+
+def build_rankings_chart_data(
+    teams: list,
+    histories_map: dict,
+    picks_map: dict,
+    pmap: dict,
+    all_fixtures: list,
+    current_gw_num: int,
+    gws_back: int = 5,
+    gws_ahead: int = 5,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """
+    Returns a tidy DataFrame: Manager | GW | Total | is_projected | rank
+    Historical rows use actual total_points from team history.
+    Projected rows add cumulative per-GW estimates to the current total.
+    """
+    from_gw = max(1, current_gw_num - gws_back + 1)
+    next_gw = current_gw_num + 1
+
+    sorted_teams = sorted(teams, key=lambda t: t["rank"])[:top_n]
+    proj_scores = _project_gw_scores(
+        sorted_teams, picks_map, pmap, all_fixtures, next_gw, gws_ahead
+    )
+
+    rows = []
+    for t in sorted_teams:
+        tid = t["entry"]
+        manager = t["player_name"]
+        rank = t["rank"]
+
+        history = histories_map.get(tid, {})
+        gw_totals = {
+            entry["event"]: entry["total_points"]
+            for entry in history.get("current", [])
+        }
+
+        # Historical rows
+        for gw in range(from_gw, current_gw_num + 1):
+            total = gw_totals.get(gw)
+            if total is not None:
+                rows.append({
+                    "Manager": manager,
+                    "GW": gw,
+                    "Total": total,
+                    "is_projected": False,
+                    "rank": rank,
+                })
+
+        # Projected rows — cumulate from current total
+        cumulative = float(t["total"])
+        for gw in range(next_gw, next_gw + gws_ahead):
+            cumulative += proj_scores.get(tid, {}).get(gw, 0)
+            rows.append({
+                "Manager": manager,
+                "GW": gw,
+                "Total": round(cumulative, 1),
+                "is_projected": True,
+                "rank": rank,
+            })
+
+    return pd.DataFrame(rows)

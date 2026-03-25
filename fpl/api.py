@@ -65,3 +65,8 @@ def live_gw_points(gw: int) -> dict:
 def fixtures() -> list:
     """All fixtures for the season (finished and upcoming)."""
     return _get(f"{BASE}/fixtures/")
+
+
+def team_history(team_id: int) -> dict:
+    """Per-GW points history for a team entry."""
+    return _get(f"{BASE}/entry/{team_id}/history/")
